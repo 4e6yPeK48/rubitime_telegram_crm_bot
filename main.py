@@ -1,22 +1,51 @@
-#TODO: сделать возможность одной услуги для нескольких сотрудников
-#TODO: сделать подтверждение записи через смс-код
+# TODO: добавить возможность выбирать время поминутно, а не только по часам
 import asyncio
+from typing import Any, Generator, TypeVar
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 import aiohttp
 import re
-
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker, selectinload
+from sqlalchemy.orm import selectinload
 from sqlalchemy import select
-
 from static.models import Cooperator, Service, async_session, ReminderRecord
 import datetime
 
 API_TOKEN = '7670668813:AAG0jpvmYxuz5_K8h2H4fUh73ueojjMmIsI'
 RUBITIME_API_KEY = '81ba535035724febc0d3c77183d6fc9dbdd259de0144ec96efe4710869d87710'
 BRANCH_ID = 16725
+SMSRU_API_ID = "3E27E597-8785-BB12-F52E-63C5247AC0FA"
+
+
+def log_func_call(func_name: str, extra: str | None = None) -> None:
+    """Логирует вызов функции."""
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    msg = f"[{now}] {func_name} called"
+    if extra:
+        msg += f" | {extra}"
+    print(msg)
+
+
+async def send_sms_code(phone: str, code: str) -> dict:
+    """Отправляет SMS-код подтверждения."""
+    log_func_call("send_sms_code", f"phone={phone}")
+    url = "https://sms.ru/sms/send"
+    phone = phone.lstrip("+")
+    params = {
+        "api_id": SMSRU_API_ID,
+        "to": phone,
+        "msg": f"Ваш код подтверждения: {code}",
+        "json": 1
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"SMS.ru error: {resp.status}, {text}")
+                return {"status": "ERROR", "message": text}
+            return await resp.json()
+
 
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -26,19 +55,29 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
-user_state = {}
+user_state: dict = {}
 
-async def get_cooperators():
+
+async def get_cooperators() -> list[Cooperator]:
+    """Возвращает список сотрудников."""
+    log_func_call("get_cooperators")
     async with async_session() as session:
         result = await session.execute(select(Cooperator).options(selectinload(Cooperator.services)))
         return result.scalars().all()
 
-async def get_services_by_cooperator(cooperator_id):
+
+async def get_services_by_cooperator(cooperator_id: int) -> list[Service]:
+    """Возвращает список услуг по сотруднику."""
+    log_func_call("get_services_by_cooperator", f"cooperator_id={cooperator_id}")
     async with async_session() as session:
         result = await session.execute(select(Service).where(Service.cooperator_id == cooperator_id))
         return result.scalars().all()
 
-async def get_available_schedule(branch_id, cooperator_id, service_id):
+
+async def get_available_schedule(branch_id: int, cooperator_id: int, service_id: int) -> dict | None:
+    """Получает доступное расписание для записи."""
+    log_func_call("get_available_schedule",
+                  f"branch_id={branch_id}, cooperator_id={cooperator_id}, service_id={service_id}")
     payload = {
         "rk": RUBITIME_API_KEY,
         "branch_id": branch_id,
@@ -46,7 +85,6 @@ async def get_available_schedule(branch_id, cooperator_id, service_id):
         "service_id": service_id,
         "only_available": 1
     }
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post("https://rubitime.ru/api2/get-schedule", json=payload) as resp:
@@ -65,12 +103,16 @@ async def get_available_schedule(branch_id, cooperator_id, service_id):
         return None
 
 
-def chunked(lst, n):
-    """Разбивает список на чанки по n элементов"""
+T = TypeVar("T")
+
+def chunked(lst: list[T], n: int) -> Generator[list[T], Any, None]:
+    """Разбивает список на чанки по n элементов."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-def get_lk_keyboard():
+
+def get_lk_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура личного кабинета."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🗂 Мои записи")],
@@ -80,7 +122,9 @@ def get_lk_keyboard():
         resize_keyboard=True
     )
 
-def get_confirm_keyboard():
+
+def get_confirm_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура подтверждения."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Да"), KeyboardButton(text="Нет")]
@@ -88,8 +132,11 @@ def get_confirm_keyboard():
         resize_keyboard=True
     )
 
+
 @dp.message(F.text == "/start")
-async def start(msg: Message):
+async def start(msg: Message) -> None:
+    """Обработчик команды /start."""
+    log_func_call("start", f"user_id={msg.from_user.id}")
     kb = get_lk_keyboard()
     await msg.answer(
         "👤 <b>Личный кабинет</b>:\n"
@@ -99,8 +146,11 @@ async def start(msg: Message):
         reply_markup=kb
     )
 
+
 @dp.message(F.text.in_(["/add", "📝 Новая запись"]))
-async def add_record(msg: Message):
+async def add_record(msg: Message) -> None:
+    """Начало сценария новой записи."""
+    log_func_call("add_record", f"user_id={msg.from_user.id}")
     user_state[msg.from_user.id] = {"date_page": 0}
     cooperators = await get_cooperators()
     names = [f"{c.id}: {c.name}" for c in cooperators]
@@ -110,8 +160,11 @@ async def add_record(msg: Message):
     )
     await msg.answer("👨‍⚕️ Выберите сотрудника:", reply_markup=kb)
 
+
 @dp.message(F.text.in_(["/my", "🗂 Мои записи"]))
-async def my_records(msg: Message):
+async def my_records(msg: Message) -> None:
+    """Показывает записи пользователя."""
+    log_func_call("my_records", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     async with async_session() as session:
         records = await session.execute(
@@ -132,8 +185,11 @@ async def my_records(msg: Message):
             )
         await msg.answer(text)
 
+
 @dp.message(F.text.in_(["/cancel", "❌ Отмена записи"]))
-async def cancel_record(msg: Message):
+async def cancel_record(msg: Message) -> None:
+    """Начало сценария отмены записи."""
+    log_func_call("cancel_record", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     async with async_session() as session:
         records = await session.execute(
@@ -152,12 +208,18 @@ async def cancel_record(msg: Message):
         )
         await msg.answer("❌ Выберите запись для отмены:", reply_markup=kb)
 
-# --- ВАЖНО: ниже идут обработчики сценария записи, добавляем фильтр по тексту ---
+
 def is_lk_command(text: str) -> bool:
+    """Проверяет, является ли текст командой личного кабинета."""
     return text in ["/my", "Мои записи", "/add", "Новая запись", "/cancel", "Отмена записи"]
 
-@dp.message(F.func(lambda m: not is_lk_command(m.text) and "cooperator_id" not in user_state.get(m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
-async def select_cooperator(msg: Message):
+
+@dp.message(F.func(lambda m: not is_lk_command(m.text) and "cooperator_id" not in user_state.get(m.from_user.id,
+                                                                                                 {}) and not m.text.startswith(
+    "/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
+async def select_cooperator(msg: Message) -> None:
+    """Выбор сотрудника."""
+    log_func_call("select_cooperator", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     text = msg.text.strip()
     try:
@@ -180,8 +242,13 @@ async def select_cooperator(msg: Message):
     )
     await msg.answer("💼 Выберите услугу:", reply_markup=kb)
 
-@dp.message(F.func(lambda m: not is_lk_command(m.text) and "service_id" not in user_state.get(m.from_user.id, {}) and "services" in user_state.get(m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
-async def select_service(msg: Message):
+
+@dp.message(F.func(lambda m: not is_lk_command(m.text) and "service_id" not in user_state.get(m.from_user.id,
+                                                                                              {}) and "services" in user_state.get(
+    m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
+async def select_service(msg: Message) -> None:
+    """Выбор услуги."""
+    log_func_call("select_service", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     services = user_state[uid]["services"]
     text = msg.text.strip()
@@ -203,7 +270,10 @@ async def select_service(msg: Message):
     user_state[uid]["date_page"] = 0
     await send_date_page(msg, uid)
 
-async def send_date_page(msg, uid):
+
+async def send_date_page(msg: Message, uid: int) -> None:
+    """Показывает страницу выбора даты."""
+    log_func_call("send_date_page", f"user_id={uid}")
     schedule = user_state[uid]["schedule"]
     dates = sorted(schedule.keys())
     page = user_state[uid].get("date_page", 0)
@@ -220,8 +290,13 @@ async def send_date_page(msg, uid):
     kb = ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True)
     await msg.answer("📅 Выберите дату:", reply_markup=kb)
 
-@dp.message(F.func(lambda m: not is_lk_command(m.text) and "date" not in user_state.get(m.from_user.id, {}) and "schedule" in user_state.get(m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
-async def select_date(msg: Message):
+
+@dp.message(F.func(lambda m: not is_lk_command(m.text) and "date" not in user_state.get(m.from_user.id,
+                                                                                        {}) and "schedule" in user_state.get(
+    m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
+async def select_date(msg: Message) -> None:
+    """Выбор даты записи."""
+    log_func_call("select_date", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     schedule = user_state[uid]["schedule"]
     dates = sorted(schedule.keys())
@@ -251,20 +326,22 @@ async def select_date(msg: Message):
         reply_markup=ReplyKeyboardRemove()
     )
 
-@dp.message(F.func(lambda m: not is_lk_command(m.text) and "datetime" not in user_state.get(m.from_user.id, {}) and "times" in user_state.get(m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
-async def select_time(msg: Message):
+
+@dp.message(F.func(lambda m: not is_lk_command(m.text) and "datetime" not in user_state.get(m.from_user.id,
+                                                                                            {}) and "times" in user_state.get(
+    m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
+async def select_time(msg: Message) -> None:
+    """Выбор времени записи."""
+    log_func_call("select_time", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     time = msg.text.strip()
-    # Проверка формата времени
     if not re.fullmatch(r"\d{1,2}:\d{2}", time):
         await msg.answer("Введите время в формате ЧЧ:ММ, например 12:30.")
         return
-    # Проверка доступности времени
     available_times = user_state[uid]["times"]
     if time not in available_times:
         await msg.answer("Это время недоступно для записи. Доступные варианты:\n" + ", ".join(available_times))
         return
-    # Проверка длительности услуги
     service_id = user_state[uid]["service_id"]
     async with async_session() as session:
         service = await session.get(Service, service_id)
@@ -273,37 +350,43 @@ async def select_time(msg: Message):
     end_minute = start_minute + duration
     end_hour = start_hour + end_minute // 60
     end_minute = end_minute % 60
-    # Ограничение: рабочий день до 21:00
     if end_hour > 21 or (end_hour == 21 and end_minute > 0):
         await msg.answer("Услуга не успеет завершиться до конца рабочего дня (21:00).")
         return
     user_state[uid]["datetime"] = f"{user_state[uid]['date']} {time}:00"
     await msg.answer("👤 Введи имя:")
 
-@dp.message(F.func(lambda m: not is_lk_command(m.text) and "name" not in user_state.get(m.from_user.id, {}) and "datetime" in user_state.get(m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
-async def get_name(msg: Message):
+
+@dp.message(F.func(lambda m: not is_lk_command(m.text) and "name" not in user_state.get(m.from_user.id,
+                                                                                        {}) and "datetime" in user_state.get(
+    m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
+async def get_name(msg: Message) -> None:
+    """Получает имя пользователя для записи."""
+    log_func_call("get_name", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     user_state[uid]["name"] = msg.text
     await msg.answer("📞 Введи номер телефона:")
 
+
 def normalize_phone(phone: str) -> str | None:
+    """Нормализует номер телефона."""
     phone = phone.strip().replace(' ', '').replace('-', '')
-    # +79000000000
     if re.fullmatch(r"\+7\d{10}", phone):
         return phone
-    # 79000000000
     if re.fullmatch(r"7\d{10}", phone):
         return f"+{phone}"
-    # 89000000000
     if re.fullmatch(r"8\d{10}", phone):
         return f"+7{phone[1:]}"
-    # 9000000000
     if re.fullmatch(r"\d{10}", phone):
         return f"+7{phone}"
     return None
 
-@dp.message(F.func(lambda m: "cancel_list" in user_state.get(m.from_user.id, {}) and not m.text.startswith("/") and "cancel_confirm" not in user_state.get(m.from_user.id, {})))
-async def do_cancel(msg: Message):
+
+@dp.message(F.func(lambda m: "cancel_list" in user_state.get(m.from_user.id, {}) and not m.text.startswith(
+    "/") and "cancel_confirm" not in user_state.get(m.from_user.id, {})))
+async def do_cancel(msg: Message) -> None:
+    """Выбор записи для отмены."""
+    log_func_call("do_cancel", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     cancel_list = user_state[uid]["cancel_list"]
     try:
@@ -327,8 +410,11 @@ async def do_cancel(msg: Message):
         reply_markup=get_confirm_keyboard()
     )
 
+
 @dp.message(F.func(lambda m: m.text == "Да" and "cancel_confirm" in user_state.get(m.from_user.id, {})))
-async def confirm_cancel(msg: Message):
+async def confirm_cancel(msg: Message) -> None:
+    """Подтверждение отмены записи."""
+    log_func_call("confirm_cancel", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     confirm = user_state[uid]["cancel_confirm"]
     rec_id = confirm["rec_id"]
@@ -345,7 +431,8 @@ async def confirm_cancel(msg: Message):
         }
         try:
             async with aiohttp.ClientSession() as http_session:
-                async with http_session.post("https://rubitime.ru/api2/remove-record", json=payload, timeout=10) as resp:
+                async with http_session.post("https://rubitime.ru/api2/remove-record", json=payload,
+                                             timeout=10) as resp:
                     res = await resp.json()
                     if res.get("status") == "ok":
                         await session.delete(rec)
@@ -357,14 +444,31 @@ async def confirm_cancel(msg: Message):
             await msg.answer(f"Ошибка отмены: {e}")
     user_state.pop(uid, None)
 
+
 @dp.message(F.func(lambda m: m.text == "Нет" and "cancel_confirm" in user_state.get(m.from_user.id, {})))
-async def cancel_cancel(msg: Message):
+async def cancel_cancel(msg: Message) -> None:
+    """Отмена отмены записи."""
+    log_func_call("cancel_cancel", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     user_state.pop(uid, None)
     await msg.answer("❎ Отмена записи отменена.", reply_markup=get_lk_keyboard())
 
-@dp.message(F.func(lambda m: not is_lk_command(m.text) and "phone" not in user_state.get(m.from_user.id, {}) and "name" in user_state.get(m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
-async def get_phone(msg: Message):
+
+import random
+
+
+def generate_sms_code() -> str:
+    """Генерирует случайный SMS-код."""
+    log_func_call("generate_sms_code")
+    return str(random.randint(1000, 9999))
+
+
+@dp.message(F.func(lambda m: not is_lk_command(m.text) and "phone" not in user_state.get(m.from_user.id,
+                                                                                         {}) and "name" in user_state.get(
+    m.from_user.id, {}) and not m.text.startswith("/") and "cancel_list" not in user_state.get(m.from_user.id, {})))
+async def get_phone(msg: Message) -> None:
+    """Получает номер телефона пользователя для записи."""
+    log_func_call("get_phone", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     raw_phone = msg.text
     phone = normalize_phone(raw_phone)
@@ -372,11 +476,8 @@ async def get_phone(msg: Message):
         await msg.answer("Введите номер телефона в формате +79000000000, 79000000000, 89000000000 или 9000000000.")
         return
     user_state[uid]["phone"] = phone
-    data = user_state[uid]
-
-    # Проверка на дубли по user_id и datetime
     async with async_session() as session:
-        dt = datetime.datetime.strptime(data["datetime"], "%Y-%m-%d %H:%M:%S")
+        dt = datetime.datetime.strptime(user_state[uid]["datetime"], "%Y-%m-%d %H:%M:%S")
         exists = await session.execute(
             select(ReminderRecord).where(
                 ReminderRecord.user_id == uid,
@@ -387,43 +488,64 @@ async def get_phone(msg: Message):
             await msg.answer("У вас уже есть запись на это время.")
             user_state.pop(uid, None)
             return
-
-    if "datetime" not in data:
-        await msg.answer("Ошибка: не выбрано время записи. Начните сначала командой /start.")
+    sms_code = generate_sms_code()
+    user_state[uid]["sms_code"] = sms_code
+    sms_result = await send_sms_code(phone, sms_code)
+    if sms_result.get("status") == "OK":
+        sms_info = next(iter(sms_result["sms"].values()), {})
+        print(f'SMS info: {sms_info}')
+        if sms_info.get("status") == "OK":
+            await msg.answer("Введите код из SMS для подтверждения записи:")
+        else:
+            await msg.answer("Ошибка отправки SMS. Попробуйте позже.")
+            user_state.pop(uid, None)
+            return
+    else:
+        await msg.answer("Ошибка отправки SMS. Попробуйте позже.")
         user_state.pop(uid, None)
         return
 
-    # Получаем имена врача и услуги для подтверждения
-    async with async_session() as db_session:
-        cooperator = await db_session.get(Cooperator, data["cooperator_id"])
-        service = await db_session.get(Service, data["service_id"])
-    cooperator_name = cooperator.name if cooperator else "Неизвестно"
-    service_name = service.name if service else "Неизвестно"
 
-    user_state[uid]["confirm_data"] = {
-        "cooperator_name": cooperator_name,
-        "service_name": service_name,
-        "datetime": data["datetime"],
-        "phone": phone,
-        "name": data["name"]
-    }
+@dp.message(F.func(lambda m: "sms_code" in user_state.get(m.from_user.id, {})))
+async def check_sms_code(msg: Message) -> None:
+    """Проверяет введённый SMS-код."""
+    log_func_call("check_sms_code", f"user_id={msg.from_user.id}")
+    uid = msg.from_user.id
+    code = msg.text.strip()
+    if code == user_state[uid]["sms_code"]:
+        async with async_session() as db_session:
+            cooperator = await db_session.get(Cooperator, user_state[uid]["cooperator_id"])
+            service = await db_session.get(Service, user_state[uid]["service_id"])
+        cooperator_name = cooperator.name if cooperator else "Неизвестно"
+        service_name = service.name if service else "Неизвестно"
+        user_state[uid]["confirm_data"] = {
+            "cooperator_name": cooperator_name,
+            "service_name": service_name,
+            "datetime": user_state[uid]["datetime"],
+            "phone": user_state[uid]["phone"],
+            "name": user_state[uid]["name"]
+        }
+        confirm_text = (
+            f"❓ <b>Точно хотите создать запись?</b>\n\n"
+            f"🗓 <b>Дата:</b> {user_state[uid]['datetime']}\n"
+            f"👨‍⚕️ <b>Врач:</b> {cooperator_name}\n"
+            f"💼 <b>Услуга:</b> {service_name}\n"
+            f"👤 <b>Имя:</b> {user_state[uid]['name']}\n"
+            f"📞 <b>Телефон:</b> {user_state[uid]['phone']}"
+        )
+        await msg.answer(confirm_text, reply_markup=get_confirm_keyboard())
+        user_state[uid].pop("sms_code", None)
+    else:
+        await msg.answer("Неверный код. Попробуйте ещё раз.")
 
-    confirm_text = (
-        f"❓ <b>Точно хотите создать запись?</b>\n\n"
-        f"🗓 <b>Дата:</b> {data['datetime']}\n"
-        f"👨‍⚕️ <b>Врач:</b> {cooperator_name}\n"
-        f"💼 <b>Услуга:</b> {service_name}\n"
-        f"👤 <b>Имя:</b> {data['name']}\n"
-        f"📞 <b>Телефон:</b> {phone}"
-    )
-    await msg.answer(confirm_text, reply_markup=get_confirm_keyboard())
 
 @dp.message(F.func(lambda m: m.text == "Да" and "confirm_data" in user_state.get(m.from_user.id, {})))
-async def confirm_create(msg: Message):
+async def confirm_create(msg: Message) -> None:
+    """Подтверждает создание записи."""
+    log_func_call("confirm_create", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     data = user_state[uid]
     confirm = data["confirm_data"]
-
     payload = {
         "rk": RUBITIME_API_KEY,
         "branch_id": BRANCH_ID,
@@ -434,7 +556,6 @@ async def confirm_create(msg: Message):
         "name": data["name"],
         "phone": data["phone"]
     }
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post("https://rubitime.ru/api2/create-record", json=payload, timeout=10) as resp:
@@ -465,16 +586,21 @@ async def confirm_create(msg: Message):
         await msg.answer("❌ Ошибка: превышено время ожидания ответа от Rubitime.")
     except Exception as e:
         await msg.answer(f"❌ Неизвестная ошибка: {e}")
-
     user_state.pop(uid, None)
 
+
 @dp.message(F.func(lambda m: m.text == "Нет" and "confirm_data" in user_state.get(m.from_user.id, {})))
-async def cancel_create(msg: Message):
+async def cancel_create(msg: Message) -> None:
+    """Отменяет создание записи."""
+    log_func_call("cancel_create", f"user_id={msg.from_user.id}")
     uid = msg.from_user.id
     user_state.pop(uid, None)
     await msg.answer("❎ Запись отменена.", reply_markup=get_lk_keyboard())
 
-async def save_reminder_record(user_id, dt_str, name, phone, rubitime_id):
+
+async def save_reminder_record(user_id: int, dt_str: str, name: str, phone: str, rubitime_id: int) -> None:
+    """Сохраняет запись напоминания в базу."""
+    log_func_call("save_reminder_record", f"user_id={user_id}, dt={dt_str}")
     dt = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
     async with async_session() as session:
         record = ReminderRecord(
@@ -487,7 +613,10 @@ async def save_reminder_record(user_id, dt_str, name, phone, rubitime_id):
         session.add(record)
         await session.commit()
 
-async def reminder_worker():
+
+async def reminder_worker() -> None:
+    """Фоновая задача для отправки напоминаний."""
+    log_func_call("reminder_worker")
     while True:
         now = datetime.datetime.now()
         async with async_session() as session:
@@ -496,8 +625,7 @@ async def reminder_worker():
             )
             for rec in records.scalars():
                 delta = rec.datetime - now
-                # Напоминание за 24 часа
-                if delta.total_seconds() <= 24*3600 and not rec.reminded_24h and delta.total_seconds() > 12*3600:
+                if 24 * 3600 >= delta.total_seconds() > 12 * 3600 and not rec.reminded_24h:
                     try:
                         await bot.send_message(
                             rec.user_id,
@@ -506,8 +634,7 @@ async def reminder_worker():
                         rec.reminded_24h = True
                     except Exception:
                         pass
-                # Напоминание за 12 часов
-                if delta.total_seconds() <= 12*3600 and not rec.reminded_12h and delta.total_seconds() > 0:
+                if 12 * 3600 >= delta.total_seconds() > 0 and not rec.reminded_12h:
                     try:
                         await bot.send_message(
                             rec.user_id,
@@ -517,35 +644,48 @@ async def reminder_worker():
                     except Exception:
                         pass
             await session.commit()
-        await asyncio.sleep(600)  # Проверять каждые 10 минут
+        await asyncio.sleep(600)
 
-# Инструкция по тестированию:
-# 1. Запустите Flask-приложение (например, файл app.py) командой:
-#    python app.py
-#    Откройте браузер и перейдите по адресу http://127.0.0.1:5000/
-#    Добавьте сотрудников и услуги через веб-форму.
-#
-# 2. Запустите Telegram-бота:
-#    python main.py
-#    В Telegram найдите своего бота и начните диалог с командой /start.
-#    Проверьте, что бот предлагает сотрудников и услуги из базы.
-#
-# 3. Проверьте запись через бота, убедитесь, что расписание и запись работают.
-#
-# Если всё работает — интеграция успешна!
 
-# Примечание:
-# Каждый пользователь Telegram ведёт свой диалог независимо (user_state[uid]).
-# Асинхронные запросы к базе и API не блокируют друг друга.
-# Если два пользователя записываются на разные слоты и выдерживают лимит API (5 сек), оба успешно запишутся.
-# Если оба выберут одно и то же время, второй получит ошибку от API (или запись не произойдёт).
+async def sync_records_with_rubitime() -> None:
+    """Фоновая задача для синхронизации записей с Rubitime."""
+    log_func_call("sync_records_with_rubitime")
+    while True:
+        async with async_session() as session:
+            records = await session.execute(select(ReminderRecord))
+            recs = records.scalars().all()
+            for rec in recs:
+                payload = {
+                    "id": rec.rubitime_id,
+                    "rk": RUBITIME_API_KEY
+                }
+                try:
+                    async with aiohttp.ClientSession() as http_session:
+                        async with http_session.post("https://rubitime.ru/api2/get-record", json=payload,
+                                                     timeout=10) as resp:
+                            res = await resp.json()
+                            if res.get("status") == "error":
+                                await session.delete(rec)
+                                await session.commit()
+                                print(
+                                    f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] sync: deleted local record id={rec.id} (rubitime_id={rec.rubitime_id})")
+                except Exception as e:
+                    print(
+                        f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] sync: error for record id={rec.id}: {e}")
+        await asyncio.sleep(60)
 
-async def main():
-    # Запускаем задачу-напоминалку параллельно с ботом
+
+async def main() -> None:
+    """Точка входа для запуска бота и фоновых задач."""
+    log_func_call("main")
     reminder_task = asyncio.create_task(reminder_worker())
+    sync_task = asyncio.create_task(sync_records_with_rubitime())
     await dp.start_polling(bot)
     reminder_task.cancel()
+    sync_task.cancel()
+
 
 if __name__ == "__main__":
+    log_func_call("__main__")
     asyncio.run(main())
     print('Bot started')
