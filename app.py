@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import os
 
 from flask import Flask, request, send_from_directory, redirect, url_for, render_template_string, session, flash, \
     get_flashed_messages
@@ -11,11 +12,15 @@ from main import log_func_call
 from static.models import Cooperator, Service, init_db
 from static.models import ReminderRecord, async_session
 
-app = Flask(__name__, static_folder="static")
-app.secret_key = "supersecretkey"
+from dotenv import load_dotenv
 
-LOGIN = "root"
-PASSWORD = "root"
+app = Flask(__name__, static_folder="static")
+app.secret_key = os.getenv("SECRET_KEY")
+
+load_dotenv()
+
+WEB_LOGIN = os.getenv("WEB_LOGIN")
+WEB_PASSWORD = os.getenv("WEB_PASSWORD")
 
 LOGIN_FORM = """
 <!doctype html>
@@ -69,7 +74,7 @@ def login() -> Response | str:
     if request.method == "POST":
         login = request.form.get("login", "")
         password = request.form.get("password", "")
-        if login == LOGIN and password == PASSWORD:
+        if login == WEB_LOGIN and password == WEB_PASSWORD:
             session["logged_in"] = True
             return redirect(url_for("index"))
         else:
@@ -100,7 +105,7 @@ def index() -> str:
     """Главная страница."""
     messages = get_flashed_messages(with_categories=True)
     return render_template_string(
-        open("static/main.html", encoding="utf-8").read(),
+        open("static/html/main.html", encoding="utf-8").read(),
         messages=messages
     )
 

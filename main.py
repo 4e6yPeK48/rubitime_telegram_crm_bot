@@ -1,21 +1,26 @@
 # TODO: добавить возможность выбирать время поминутно, а не только по часам
 import asyncio
+import datetime
+import os
+import re
 from typing import Any, Generator, TypeVar
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.enums import ParseMode
 import aiohttp
-import re
-from sqlalchemy.orm import selectinload
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.types import Message
+from dotenv import load_dotenv
 from sqlalchemy import select
-from static.models import Cooperator, Service, async_session, ReminderRecord
-import datetime
+from sqlalchemy.orm import selectinload
 
-API_TOKEN = '7670668813:AAG0jpvmYxuz5_K8h2H4fUh73ueojjMmIsI'
-RUBITIME_API_KEY = '81ba535035724febc0d3c77183d6fc9dbdd259de0144ec96efe4710869d87710'
-BRANCH_ID = 16725
-SMSRU_API_ID = "3E27E597-8785-BB12-F52E-63C5247AC0FA"
+from static.models import Cooperator, Service, async_session, ReminderRecord
+
+load_dotenv()
+
+TELEGRAM_API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
+RUBITIME_API_KEY = os.getenv("RUBITIME_API_KEY")
+SMSRU_API_ID = os.getenv("SMSRU_API_ID")
+BRANCH_ID = os.getenv("BRANCH_ID")
 
 
 def log_func_call(func_name: str, extra: str | None = None) -> None:
@@ -51,7 +56,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 bot = Bot(
-    token=API_TOKEN,
+    token=TELEGRAM_API_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
