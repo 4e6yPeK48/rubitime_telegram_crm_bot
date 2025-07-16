@@ -33,13 +33,14 @@ class ReminderRecord(Base):
     """Модель записи напоминания."""
     __tablename__ = "reminder_records"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    rubitime_id = Column(Integer, nullable=False)
+    rubitime_id = Column(Integer, nullable=True)
     user_id = Column(Integer, nullable=False)
     datetime = Column(DateTime, nullable=False)
     name = Column(String, nullable=False)
     phone = Column(String, nullable=False)
     reminded_24h = Column(Boolean, default=False)
     reminded_12h = Column(Boolean, default=False)
+    confirmed = Column(Boolean, default=False)
 
 
 async def init_db() -> None:

@@ -1,263 +1,298 @@
-import asyncio
 import datetime
 import os
+from contextlib import asynccontextmanager
+from collections import defaultdict
 
-from flask import Flask, request, send_from_directory, redirect, url_for, render_template_string, session, flash, \
-    get_flashed_messages
-from flask import jsonify
-from sqlalchemy import select
-from werkzeug import Response
-
-from main import log_func_call
-from static.models import Cooperator, Service, init_db
-from static.models import ReminderRecord, async_session
-
+from fastapi import FastAPI, Request, Depends, Form, status, Response, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import jwt, JWTError
+from pydantic import BaseModel, ValidationError, constr, conint, confloat
 from dotenv import load_dotenv
+from sqlalchemy import select
 
-app = Flask(__name__, static_folder="static")
-app.secret_key = os.getenv("SECRET_KEY")
+from main import log_func_call, clear_cooperators_cache, clear_services_cache
+from static.models import Cooperator, Service, init_db, ReminderRecord, async_session
 
 load_dotenv()
 
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
 WEB_LOGIN = os.getenv("WEB_LOGIN")
 WEB_PASSWORD = os.getenv("WEB_PASSWORD")
 
-LOGIN_FORM = """
-<!doctype html>
-<html lang="ru">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Вход</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-LN+7fdVzj6u52u30Kp6M/trliBMCMKTyK833zpbD+pXdCLuTusPj697FH4R/5mcr" crossorigin="anonymous">
-  </head>
-  <body>
-    <div class="container py-5">
-      <div class="row justify-content-center">
-        <div class="col-md-4">
-          <div class="card shadow">
-            <div class="card-body">
-              <h2 class="card-title mb-4 text-center">Вход</h2>
-              {% with messages = get_flashed_messages() %}
-                {% if messages %}
-                  <div class="alert alert-danger" role="alert">{{ messages[0] }}</div>
-                {% endif %}
-              {% endwith %}
-              <form method="post" action="/login">
-                <div class="mb-3">
-                  <input type="text" name="login" class="form-control" placeholder="Логин" required>
-                </div>
-                <div class="mb-3">
-                  <input type="password" name="password" class="form-control" placeholder="Пароль" required>
-                </div>
-                <button type="submit" class="btn btn-primary w-100">Войти</button>
-              </form>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.bundle.min.js" integrity="sha384-ndDqU0Gzau9qJ1lfW4pNLlhNTkCfHzAVBReH9diLvGRem5+R9g2FzA8ZGN954O5Q" crossorigin="anonymous"></script>
-  </body>
-</html>
-"""
+LOGIN_ATTEMPTS_LIMIT = int(os.getenv("LOGIN_ATTEMPTS_LIMIT"))
+LOGIN_ATTEMPTS_WINDOW = int(os.getenv("LOGIN_ATTEMPTS_WINDOW"))
+login_attempts = defaultdict(list)
 
 
-def is_logged_in() -> bool:
-    """Проверяет, авторизован ли пользователь."""
-    return session.get("logged_in", False)
+@asynccontextmanager
+async def lifespan(app):
+    await init_db()
+    yield
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login() -> Response | str:
-    """Обрабатывает вход пользователя."""
-    if request.method == "POST":
-        login = request.form.get("login", "")
-        password = request.form.get("password", "")
-        if login == WEB_LOGIN and password == WEB_PASSWORD:
-            session["logged_in"] = True
-            return redirect(url_for("index"))
-        else:
-            flash("Неверный логин или пароль")
-            return render_template_string(LOGIN_FORM)
-    return render_template_string(LOGIN_FORM)
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="static/html")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
-@app.route("/logout")
-def logout() -> Response:
-    """Выход пользователя из системы."""
-    session.clear()
-    return redirect(url_for("login"))
+class CooperatorForm(BaseModel):
+    id: conint(gt=0)
+    branch_id: conint(gt=0)
+    name: constr(min_length=1, max_length=100)
 
 
-@app.before_request
-def require_login() -> Response | None:
-    """Проверяет авторизацию перед каждым запросом."""
-    if request.endpoint in ("login", "static_files"):
-        return None
-    if not is_logged_in():
-        return redirect(url_for("login"))
-    return None
+class ServiceForm(BaseModel):
+    id: conint(gt=0)
+    branch_id: conint(gt=0)
+    cooperator_id: conint(gt=0)
+    name: constr(min_length=1, max_length=100)
+    price: confloat(gt=0)
+    duration: conint(gt=0, le=480)
 
 
-@app.route("/")
-def index() -> str:
-    """Главная страница."""
-    messages = get_flashed_messages(with_categories=True)
-    return render_template_string(
-        open("static/html/main.html", encoding="utf-8").read(),
-        messages=messages
+def create_access_token(data: dict) -> str:
+    from datetime import timedelta, datetime
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(hours=8)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_303_SEE_OTHER,
+        detail="Could not validate credentials",
+        headers={"Location": "/login"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        login = payload.get("login")
+        if login != WEB_LOGIN:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    return login
+
+
+def get_token_from_cookie(request: Request):
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=303, headers={"Location": "/login"})
+    return token
+
+
+def is_login_allowed(ip: str) -> bool:
+    now = datetime.datetime.now().timestamp()
+    attempts = login_attempts[ip]
+    login_attempts[ip] = [ts for ts in attempts if now - ts < LOGIN_ATTEMPTS_WINDOW]
+    return len(login_attempts[ip]) < LOGIN_ATTEMPTS_LIMIT
+
+
+def register_login_attempt(ip: str):
+    now = datetime.datetime.now().timestamp()
+    login_attempts[ip].append(now)
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_get(request: Request):
+    msg = request.query_params.get("msg")
+    return templates.TemplateResponse("login.html", {"request": request, "msg": msg})
+
+
+@app.post("/login")
+async def login_post(request: Request, login: str = Form(...), password: str = Form(...)):
+    ip = request.client.host
+    if not is_login_allowed(ip):
+        return RedirectResponse(url="/login?msg=Слишком+много+попыток,+попробуйте+через+10+минут", status_code=303)
+    register_login_attempt(ip)
+    if login == WEB_LOGIN and password == WEB_PASSWORD:
+        token = create_access_token({"login": login})
+        response = RedirectResponse(url="/", status_code=303)
+        response.set_cookie("access_token", token, httponly=True, max_age=8 * 3600)
+        login_attempts[ip] = []
+        return response
+    return RedirectResponse(url="/login?msg=Неверный+логин+или+пароль", status_code=303)
+
+
+@app.get("/logout")
+async def logout():
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("access_token")
+    return response
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request, token: str = Depends(get_token_from_cookie)):
+    msg = request.query_params.get("msg")
+    async with async_session() as session:
+        cooperators = await session.execute(select(Cooperator))
+        cooperators = cooperators.scalars().all()
+        services = await session.execute(select(Service))
+        services = services.scalars().all()
+    return templates.TemplateResponse(
+        "main.html",
+        {
+            "request": request,
+            "messages": [("success", msg)] if msg else [],
+            "cooperators": cooperators,
+            "services": services
+        }
     )
 
 
-@app.route("/static/<path:path>")
-def static_files(path: str) -> object:
-    """Обслуживает статические файлы."""
-    return send_from_directory("static", path)
+@app.get("/api/cooperators")
+async def api_cooperators(token: str = Depends(get_token_from_cookie)):
+    async with async_session() as session:
+        result = await session.execute(select(Cooperator))
+        cooperators = result.scalars().all()
+    return [{"id": c.id, "branch_id": c.branch_id, "name": c.name} for c in cooperators]
 
 
-@app.route("/add_cooperator", methods=["POST"])
-def add_cooperator() -> object:
-    """Добавляет нового сотрудника."""
-    data = request.form
+@app.get("/api/services")
+async def api_services(token: str = Depends(get_token_from_cookie)):
+    async with async_session() as session:
+        result = await session.execute(select(Service))
+        services = result.scalars().all()
+    return [
+        {
+            "id": s.id,
+            "branch_id": s.branch_id,
+            "cooperator_id": s.cooperator_id,
+            "name": s.name,
+            "price": s.price,
+            "duration": s.duration
+        }
+        for s in services
+    ]
+
+
+@app.post("/add_cooperator")
+async def add_cooperator(
+        request: Request,
+        token: str = Depends(get_token_from_cookie),
+        id: int = Form(...),
+        branch_id: int = Form(...),
+        name: str = Form(...)
+):
     try:
-        cooperator_id = int(data.get("id", ""))
-        branch_id = int(data.get("branch_id", ""))
-        name = data.get("name", "").strip()
-        if not name:
-            flash("Имя сотрудника не может быть пустым", "error")
-            return redirect(url_for("index"))
-    except Exception:
-        flash("Некорректные данные сотрудника", "error")
-        return redirect(url_for("index"))
-
-    async def add() -> bool:
-        """Асинхронно добавляет сотрудника в базу."""
-        async with async_session() as session:
-            exists = await session.get(Cooperator, cooperator_id)
+        form = CooperatorForm(id=id, branch_id=branch_id, name=name)
+    except ValidationError:
+        return RedirectResponse(url="/?msg=Некорректные+данные+сотрудника", status_code=303)
+    async with async_session() as session:
+        async with session.begin():
+            exists = await session.get(Cooperator, form.id)
             if exists:
-                return False
-            cooperator = Cooperator(
-                id=cooperator_id,
-                branch_id=branch_id,
-                name=name
-            )
+                return RedirectResponse(url="/?msg=Сотрудник+с+таким+ID+уже+существует", status_code=303)
+            cooperator = Cooperator(id=form.id, branch_id=form.branch_id, name=form.name)
             session.add(cooperator)
-            await session.commit()
-            return True
-
-    result = asyncio.run(add())
-    if not result:
-        flash("Сотрудник с таким ID уже существует", "error")
-        return redirect(url_for("index"))
-    flash("Сотрудник успешно добавлен!", "success")
-    return redirect(url_for("index"))
+    clear_cooperators_cache()
+    return RedirectResponse(url="/?msg=Сотрудник+успешно+добавлен!", status_code=303)
 
 
-@app.route("/add_service", methods=["POST"])
-def add_service() -> object:
-    """Добавляет новую услугу."""
-    data = request.form
+@app.post("/add_service")
+async def add_service(
+        request: Request,
+        token: str = Depends(get_token_from_cookie),
+        id: int = Form(...),
+        branch_id: int = Form(...),
+        cooperator_id: int = Form(...),
+        name: str = Form(...),
+        price: float = Form(...),
+        duration: int = Form(...)
+):
     try:
-        service_id = int(data.get("id", ""))
-        branch_id = int(data.get("branch_id", ""))
-        cooperator_id = int(data.get("cooperator_id", ""))
-        name = data.get("name", "").strip()
-        price = float(data.get("price", ""))
-        duration = int(data.get("duration", ""))
-        if not name:
-            flash("Название услуги не может быть пустым", "error")
-            return redirect(url_for("index"))
-    except Exception:
-        flash("Некорректные данные услуги", "error")
-        return redirect(url_for("index"))
-
-    async def add() -> bool:
-        """Асинхронно добавляет услугу в базу."""
-        async with async_session() as session:
-            exists = await session.get(Service, service_id)
+        form = ServiceForm(
+            id=id, branch_id=branch_id, cooperator_id=cooperator_id,
+            name=name, price=price, duration=duration
+        )
+    except ValidationError:
+        return RedirectResponse(url="/?msg=Некорректные+данные+услуги", status_code=303)
+    async with async_session() as session:
+        async with session.begin():
+            exists = await session.get(Service, form.id)
             if exists:
-                return False
+                return RedirectResponse(url="/?msg=Услуга+с+таким+ID+уже+существует", status_code=303)
             service = Service(
-                id=service_id,
-                branch_id=branch_id,
-                cooperator_id=cooperator_id,
-                name=name,
-                price=price,
-                duration=duration
+                id=form.id, branch_id=form.branch_id, cooperator_id=form.cooperator_id,
+                name=form.name, price=form.price, duration=form.duration
             )
             session.add(service)
-            await session.commit()
-            return True
-
-    result = asyncio.run(add())
-    if not result:
-        flash("Услуга с таким ID уже существует", "error")
-        return redirect(url_for("index"))
-    flash("Услуга успешно добавлена!", "success")
-    return redirect(url_for("index"))
+    clear_services_cache(form.cooperator_id)
+    return RedirectResponse(url="/?msg=Услуга+успешно+добавлена!", status_code=303)
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook() -> object:
-    """Обрабатывает вебхук от Rubitime."""
-    log_func_call("webhook", f"request from {request.remote_addr}")
+@app.post("/webhook")
+async def webhook(request: Request):
+    log_func_call("webhook", f"request from {request.client.host}")
     try:
-        data = request.get_json(force=True)
+        data = await request.json()
         log_func_call("webhook", f"event={data.get('event')}, data={data.get('data')}")
         event = data.get("event")
         record_data = data.get("data", {})
         rubitime_id = record_data.get("id")
-
-        async def upsert_record() -> None:
-            """Создаёт, обновляет или удаляет запись напоминания."""
-            async with async_session() as session:
-                rec = await session.execute(
-                    select(ReminderRecord).where(ReminderRecord.rubitime_id == rubitime_id)
-                )
-                rec = rec.scalars().first()
-                dt_str = record_data.get("record")
-                name = record_data.get("name", "")
-                phone = record_data.get("phone", "")
-                user_id = record_data.get("user_id", None)
-                dt = None
-                try:
-                    dt = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
-                if event == "event-create-record":
-                    log_func_call("webhook", f"event-create-record rubitime_id={rubitime_id}")
-                    if not rec and dt and user_id:
-                        new_rec = ReminderRecord(
-                            rubitime_id=rubitime_id,
-                            user_id=user_id,
-                            datetime=dt,
-                            name=name,
-                            phone=phone
-                        )
-                        session.add(new_rec)
-                        await session.commit()
-                elif event == "event-update-record":
-                    log_func_call("webhook", f"event-update-record rubitime_id={rubitime_id}")
-                    if rec and dt:
-                        rec.datetime = dt
-                        rec.name = name
-                        rec.phone = phone
-                        await session.commit()
-                elif event == "event-remove-record":
-                    log_func_call("webhook", f"event-remove-record rubitime_id={rubitime_id}")
-                    if rec:
-                        await session.delete(rec)
-                        await session.commit()
-
-        asyncio.run(upsert_record())
-        return jsonify({"status": "ok"})
+        async with async_session() as session:
+            rec = await session.execute(
+                select(ReminderRecord).where(ReminderRecord.rubitime_id == rubitime_id)
+            )
+            rec = rec.scalars().first()
+            dt_str = record_data.get("record")
+            name = record_data.get("name", "")
+            phone = record_data.get("phone", "")
+            user_id = record_data.get("user_id", None)
+            dt = None
+            try:
+                dt = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+            if event == "event-create-record":
+                log_func_call("webhook", f"event-create-record rubitime_id={rubitime_id}")
+                if not rec and dt and user_id:
+                    new_rec = ReminderRecord(
+                        rubitime_id=rubitime_id,
+                        user_id=user_id,
+                        datetime=dt,
+                        name=name,
+                        phone=phone
+                    )
+                    session.add(new_rec)
+                    await session.commit()
+            elif event == "event-update-record":
+                log_func_call("webhook", f"event-update-record rubitime_id={rubitime_id}")
+                if rec and dt:
+                    rec.datetime = dt
+                    rec.name = name
+                    rec.phone = phone
+                    await session.commit()
+            elif event == "event-remove-record":
+                log_func_call("webhook", f"event-remove-record rubitime_id={rubitime_id}")
+                if rec:
+                    await session.delete(rec)
+                    await session.commit()
+        return JSONResponse({"status": "ok"})
     except Exception as e:
         log_func_call("webhook", f"error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 400
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
 
 
-if __name__ == "__main__":
-    with app.app_context():
-        asyncio.run(init_db())
-    app.run(debug=True)
+@app.post("/token")
+async def login_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    if form_data.username == WEB_LOGIN and form_data.password == WEB_PASSWORD:
+        token = create_access_token({"login": form_data.username})
+        return {"access_token": token, "token_type": "bearer"}
+    raise HTTPException(status_code=400, detail="Incorrect username or password")
+
+
+@app.get("/me")
+async def me(token: str = Depends(get_token_from_cookie)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        login = payload.get("login")
+        return {"login": login}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
