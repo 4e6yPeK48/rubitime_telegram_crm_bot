@@ -1,0 +1,206 @@
+Через API доступно:
+
+- получение, создание, обновление и удаление записи;
+- получение дат и времени для записи;
+- отправка вебхука о создании, обновлении и удалении записи.
+
+Для использования API необходимо сгенерировать ключ доступа на 5 шаге настроек, в блоке "Получение и сохранение данных при помощи API". Для генерации ключа нужно нажать кнопку "Сгенерировать ключ", для перегенерации "Перегенерировать ключ", для удаления "Удалить ключ".
+
+Чтобы отправлять вебхуки о событиях (создание, обновление, удаление) - нужно дополнительно указать URL адрес в поле "Вебхук URL".
+Получение, создание, обновление и удаление записи
+
+Для получения/передачи данных необходимо вызвать метод https://rubitime.ru/api2/{method} (где {method} - название метода из таблицы ниже), передать в массиве ключ "rk" со значением API ключа и дополнительные параметры POST запросом в формате JSON:
+Метод	Параметры	Описание
+get-record	'id' => 1 // id записи
+'rk' => 'xxx' // API ключ	Получить данные о записи по id.
+create-record
+и update-record	'id' => 79379, // только для update-record
+'branch_id' => '1013', // id филиала
+'cooperator_id' => '1702', // id сотрудника
+'service_id' => '3925', // id услуги
+'record' => '2020-01-18 20:00', // дата и время, на которое записан клиент
+'rk' => 'xxx', // API ключ
+Показать все параметры
+	Создание новой записи и редактирование существующей записи. Обязательные для заполнения параметры при создании новой записи: branch_id, cooperator_id, service_id, status, record, rk. При обновлении: id и rk.
+remove-record	'id' => 79379,
+'rk' => 'xxx' // API ключ	Удалить запись по id.
+
+В ответе возвращается массив, содержащий 3 ключа:
+
+status - может быть ok или error;
+message - текст сообщения;
+data - результат выполнения запроса (массив с данными).
+
+Отправлять запросы можно не чаще одного раза в 5 секунд.
+Пример запроса:
+
+$action = 'create-record'; // указываем действие (метод)
+$rk = 'xxx'; // указываем ключ
+
+// получаем запись
+if ($action == 'get-record') {
+    $queryData = ['id' => 50];
+
+// создаем запись
+} elseif ($action == 'create-record') {
+    $queryData = [
+        'branch_id' => 1,
+        'cooperator_id' => 2,
+        'service_id' => 4,
+        'status' => 0,
+        'record' => '2021-12-08 13:30:03',
+        'name' => 'Test name',
+        'price' => 50.25,
+        'phone' => '+77999999998',
+        'email' => 'test@test.ru',
+        'comment' => 'Test comment',
+        'reminder' => '2021-12-12 00:00:00',
+        'reminder_minutes' => 60,
+    ];
+
+// обновляем запись (например: делаем ее оплаченной и переводим в статус "Записан")
+} elseif ($action == 'update-record') {
+    $queryData = [
+        'id' => 50,
+        'prepayment' => 100,
+        'prepayment_date' => '2021-12-01 10:00:00',
+        'status' => 0,
+    ];
+
+// удаляем запись
+} elseif ($action == 'remove-record') {
+    $queryData = ['id' => 50];
+}
+
+$queryData['rk'] = $rk;
+$queryUrl = 'https://rubitime.ru/api2/'.$action;
+
+$curl = curl_init();
+curl_setopt_array($curl, [
+    CURLOPT_POST => true,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_URL => $queryUrl,
+    CURLOPT_POSTFIELDS => json_encode($queryData),
+]);
+
+$result = curl_exec($curl);
+curl_close($curl);
+
+$result = json_decode($result, true);
+if ($result) {
+    if ($result['status'] == 'ok') {
+        echo "Success: {$result['message']}"; // сообщение о успешном запросе
+        var_dump($result['data']); // полученные данные
+    } else {
+        echo "Error: {$result['message']}"; // // сообщение об ошибке при выполнении запроса
+    }
+} else {
+    echo "Empty response"; // запрос не вернул никакого результата
+}
+
+Пример ответа:
+
+{
+    "status": "ok",
+    "message": "Success",
+    "data": {
+        "id": 123, // id созданной записи
+        "url": "https://rubitime.ru/card/xxx" // url созданной записи
+    }
+}
+
+
+Получение дат и времени для записи
+
+Для получения дат и времени необходимо отправить POST-запрос на URL https://rubitime.ru/api2/get-schedule и передать в массиве ключ "rk" со значением API ключа, а так же обязательные параметры: branch_id, cooperator_id, service_id.
+
+В качестве дополнительного параметра в запросе можно использовать: only_available. Значение 1 отобразит только даты и время доступные для записи, значение 0 отобразит только занятые даты, отстутсвие параметра отобразит все даты.
+Пример запроса:
+
+$url = 'https://rubitime.ru/api2/get-schedule'; // URL-запроса
+$params = [
+    'rk' => 'xxx', // указываем ключ
+    'branch_id' => 1, // ID филиала
+    'cooperator_id' => 3, // ID сотрудника
+    'service_id' => 2, // ID услуги
+    //'only_available' => 1, // выведет только даты и время доступное для записи
+];
+
+$curl = curl_init();
+curl_setopt_array($curl, [
+    CURLOPT_POST => true,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_URL => $url,
+    CURLOPT_POSTFIELDS => json_encode($params),
+]);
+
+$result = curl_exec($curl);
+curl_close($curl);
+
+$result = json_decode($result, true);
+if ($result) {
+    if ($result['status'] == 'ok') {
+        var_dump($result['data']); // полученные данные
+    } else {
+        echo "Error: {$result['message']}"; // // сообщение об ошибке при выполнении запроса
+    }
+} else {
+    echo "Empty response"; // запрос не вернул никакого результата
+}
+
+Пример ответа:
+
+{
+    "status":"ok",
+    "message":"Success",
+    "data": {
+        "2024-04-19": {
+            "11:00": {
+                "available": false
+            },
+            "12:00": {
+                "available": true
+            },
+            "13:00": {
+                "available": false
+            },
+        },
+        "2024-04-20": {
+            "11:00": {
+                "available": true
+            },
+            "12:00": {
+                "available": false
+            },
+            "13:00": {
+                "available": false
+            },
+        },
+        ...
+    }
+}
+
+
+Отправка вебхука о создании, обновлении и удалении записи
+
+Вебхуки отправляются при создании/редактировании/удалении записей на указанный в настройках URL (Настройки -> API -> Получение и сохранение данных при помощи API -> Вебхук URL).
+
+Чтобы вебхук считался полученным, сервер должен ответить кодом 200.
+
+Формат передачи данных:
+
+// event-create-record - создана новая запись;
+// event-update-record - обновлена запись;
+// event-remove-record - удалена запись.
+
+{
+    "from": "user",
+    "event": "event-create-record",
+    "data": {
+        "id": 123, // id созданной записи
+        "record" "2021-12-07 09:30:00", // дата записи
+        "name": "Иванов Иван Иванович", // url созданной записи
+        "price": "300", // цена
+        ... // все ключи можно посмотреть в методе get-record
+    }
+}
