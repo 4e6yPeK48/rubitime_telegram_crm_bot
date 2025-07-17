@@ -1,4 +1,8 @@
 # TODO: добавить возможность выбирать время поминутно, а не только по часам
+# TODO: добавить кнопку возврата на каждый шаг
+# TODO: на админ-панель добавить выпадающий список с полями текущих (уже содержащихся в таблице) филиалов, сотрудников, услуг
+#  (список состоит из 5 строк, листается) для каждого поля (сейчас всё вводится вручную)
+#  + строка для ручного ввода, если админ хочет добавить новое
 import asyncio
 import datetime
 import os
@@ -257,7 +261,6 @@ async def my_records(msg: Message) -> None:
                 f"🗓 <b>{r.datetime.strftime('%Y-%m-%d %H:%M')}</b>\n"
                 f"👤 {r.name}\n"
                 f"📞 {r.phone}\n"
-                f"🆔 ID: {r.id}\n"
                 "------\n"
             )
         await msg.answer(text)
@@ -561,8 +564,7 @@ async def confirm_create(msg: Message, state: FSMContext) -> None:
                         f"👨‍⚕️ <b>Врач:</b> {confirm['cooperator_name']}\n"
                         f"💼 <b>Услуга:</b> {confirm['service_name']}\n"
                         f"👤 <b>Имя:</b> {confirm['name']}\n"
-                        f"📞 <b>Телефон:</b> {confirm['phone']}\n"
-                        f"🆔 <b>Rubitime Id:</b> {res['data']['id']}",
+                        f"📞 <b>Телефон:</b> {confirm['phone']}\n",
                         reply_markup=get_lk_keyboard()
                     )
                     await save_reminder_record(
@@ -613,8 +615,7 @@ async def confirm_cancel_record(msg: Message, state: FSMContext) -> None:
     await state.set_state(BookingStates.confirming_cancel)
     await msg.answer(
         f"❓ <b>Точно хотите отменить запись?</b>\n"
-        f"🗓 <b>Дата:</b> {record[2].strftime('%Y-%m-%d %H:%M')}\n"
-        f"🆔 <b>ID:</b> {record[0]}",
+        f"🗓 <b>Дата:</b> {record[2].strftime('%Y-%m-%d %H:%M')}\n",
         reply_markup=get_confirm_keyboard()
     )
 

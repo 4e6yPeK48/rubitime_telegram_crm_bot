@@ -1,20 +1,24 @@
 import datetime
 import os
-from contextlib import asynccontextmanager
+import traceback
 from collections import defaultdict
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Depends, Form, status, Response, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, Depends, Form, status, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import jwt, JWTError
 from pydantic import BaseModel, ValidationError, constr, conint, confloat
-from dotenv import load_dotenv
 from sqlalchemy import select
 
-from main import log_func_call, clear_cooperators_cache, clear_services_cache
-from static.models import Cooperator, Service, init_db, ReminderRecord, async_session
+from main import log_func_call
+from services.auth_service import create_access_token
+from services.cooperator_service import get_cooperators, add_cooperator
+from services.service_service import get_services, add_service
+from static.models import init_db, ReminderRecord, async_session
 
 load_dotenv()
 
@@ -54,14 +58,6 @@ class ServiceForm(BaseModel):
     name: constr(min_length=1, max_length=100)
     price: confloat(gt=0)
     duration: conint(gt=0, le=480)
-
-
-def create_access_token(data: dict) -> str:
-    from datetime import timedelta, datetime
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(hours=8)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
@@ -130,35 +126,32 @@ async def logout():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, token: str = Depends(get_token_from_cookie)):
     msg = request.query_params.get("msg")
-    async with async_session() as session:
-        cooperators = await session.execute(select(Cooperator))
-        cooperators = cooperators.scalars().all()
-        services = await session.execute(select(Service))
-        services = services.scalars().all()
+    cooperators = await get_cooperators()
+    services = await get_services()
+    cooperator_id_names = [f"{c.id} | {c.name}" for c in cooperators]
+    service_id_names = [f"{s.id} | {s.name}" for s in services]
     return templates.TemplateResponse(
         "main.html",
         {
             "request": request,
             "messages": [("success", msg)] if msg else [],
             "cooperators": cooperators,
-            "services": services
+            "services": services,
+            "cooperator_id_names": cooperator_id_names,
+            "service_id_names": service_id_names
         }
     )
 
 
 @app.get("/api/cooperators")
 async def api_cooperators(token: str = Depends(get_token_from_cookie)):
-    async with async_session() as session:
-        result = await session.execute(select(Cooperator))
-        cooperators = result.scalars().all()
+    cooperators = await get_cooperators()
     return [{"id": c.id, "branch_id": c.branch_id, "name": c.name} for c in cooperators]
 
 
 @app.get("/api/services")
 async def api_services(token: str = Depends(get_token_from_cookie)):
-    async with async_session() as session:
-        result = await session.execute(select(Service))
-        services = result.scalars().all()
+    services = await get_services()
     return [
         {
             "id": s.id,
@@ -173,7 +166,7 @@ async def api_services(token: str = Depends(get_token_from_cookie)):
 
 
 @app.post("/add_cooperator")
-async def add_cooperator(
+async def add_cooperator_route(
         request: Request,
         token: str = Depends(get_token_from_cookie),
         id: int = Form(...),
@@ -184,19 +177,14 @@ async def add_cooperator(
         form = CooperatorForm(id=id, branch_id=branch_id, name=name)
     except ValidationError:
         return RedirectResponse(url="/?msg=Некорректные+данные+сотрудника", status_code=303)
-    async with async_session() as session:
-        async with session.begin():
-            exists = await session.get(Cooperator, form.id)
-            if exists:
-                return RedirectResponse(url="/?msg=Сотрудник+с+таким+ID+уже+существует", status_code=303)
-            cooperator = Cooperator(id=form.id, branch_id=form.branch_id, name=form.name)
-            session.add(cooperator)
-    clear_cooperators_cache()
+    success = await add_cooperator(form.id, form.branch_id, form.name)
+    if not success:
+        return RedirectResponse(url="/?msg=Сотрудник+с+таким+ID+уже+существует", status_code=303)
     return RedirectResponse(url="/?msg=Сотрудник+успешно+добавлен!", status_code=303)
 
 
 @app.post("/add_service")
-async def add_service(
+async def add_service_route(
         request: Request,
         token: str = Depends(get_token_from_cookie),
         id: int = Form(...),
@@ -213,17 +201,12 @@ async def add_service(
         )
     except ValidationError:
         return RedirectResponse(url="/?msg=Некорректные+данные+услуги", status_code=303)
-    async with async_session() as session:
-        async with session.begin():
-            exists = await session.get(Service, form.id)
-            if exists:
-                return RedirectResponse(url="/?msg=Услуга+с+таким+ID+уже+существует", status_code=303)
-            service = Service(
-                id=form.id, branch_id=form.branch_id, cooperator_id=form.cooperator_id,
-                name=form.name, price=form.price, duration=form.duration
-            )
-            session.add(service)
-    clear_services_cache(form.cooperator_id)
+    success = await add_service(
+        form.id, form.branch_id, form.cooperator_id,
+        form.name, form.price, form.duration
+    )
+    if not success:
+        return RedirectResponse(url="/?msg=Услуга+с+таким+ID+уже+существует", status_code=303)
     return RedirectResponse(url="/?msg=Услуга+успешно+добавлена!", status_code=303)
 
 
